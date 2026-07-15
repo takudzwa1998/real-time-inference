@@ -1,0 +1,253 @@
+name: real-time-inference
+
+# ─────────────────────────────────────────────────────────
+# Shared configuration fragments
+# ─────────────────────────────────────────────────────────
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-restart: &always-restart
+  restart: unless-stopped
+
+x-healthcheck-defaults: &hc-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+# ─────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────
+services:
+
+  # ── Infrastructure ──────────────────────────────────────
+
+  # What it is:  PostgreSQL 16 — relational database engine.
+  # What it does: Stores cameras, detections (JSONB), alert rules, and audit events; seeds the schema from 001_initial_schema.sql on first boot.
+  # Persistent state: DURABLE — all data lives in the named volume `postgres_data`; restarting the container changes nothing.
+  postgres:
+    image: postgres:16-alpine
+    <<: *always-restart
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-inference}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inference}
+      POSTGRES_DB: ${POSTGRES_DB:-inference}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - inference-net
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-inference} -d ${POSTGRES_DB:-inference}"]
+    logging: *default-logging
+
+  # What it is:  RabbitMQ 3.13 — message broker with management UI.
+  # What it does: Receives detection events from the inference service and fans them out to the consumer via the `detections` topic exchange.
+  # Persistent state: DURABLE — queued messages and topology survive restarts via the named volume `rabbitmq_data` and `definitions.json`.
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    <<: *always-restart
+    hostname: rabbitmq  # stable hostname so mnesia node name is consistent
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./infra/rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    networks:
+      - inference-net
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+    logging: *default-logging
+
+  # ── Application services ────────────────────────────────
+
+  # What it is:  Inference service — the core CV pipeline (Python / FastAPI).
+  # What it does: Captures frames from RTSP/webcam sources, runs YOLO detection on worker threads, and publishes results to RabbitMQ.
+  # Persistent state: SEMI-DURABLE — downloaded YOLO model weights persist in `yolo_models`; in-flight frames in the bounded queue are lost on restart.
+  inference:
+    build:
+      context: ./services/inference
+      dockerfile: Dockerfile
+    <<: *always-restart
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      DETECTIONS_EXCHANGE: detections
+      METRICS_PORT: "8001"
+      YOLOX_MODEL: ${YOLOX_MODEL:-yolox-nano}
+    volumes:
+      # Bind-mount the project-local weights/ folder so downloaded .pth files
+      # are visible on the host and survive container rebuilds/restarts.
+      # The folder is gitignored — weights are auto-downloaded on first startup.
+      - ./weights:/model-weights
+    networks:
+      - inference-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+    logging: *default-logging
+
+  # What it is:  Consumer service — the persistence and alerting worker (Python / FastAPI).
+  # What it does: Subscribes to RabbitMQ, batch-inserts detections into PostgreSQL, evaluates alert rules, and fires Telegram/webhook notifications.
+  # Persistent state: STATELESS — all state is in PostgreSQL; restarting loses nothing (unacked messages are requeued by RabbitMQ automatically).
+  consumer:
+    build:
+      context: ./services/consumer
+      dockerfile: Dockerfile
+    <<: *always-restart
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER:-inference}:${POSTGRES_PASSWORD:-inference}@postgres:5432/${POSTGRES_DB:-inference}
+      METRICS_PORT: "8002"
+    networks:
+      - inference-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+    logging: *default-logging
+
+  # What it is:  API gateway — the public-facing backend (Python / FastAPI).
+  # What it does: Serves REST endpoints for camera/detection/alert CRUD, fans out live detections over WebSocket, and exposes Prometheus metrics.
+  # Persistent state: STATELESS — reads/writes PostgreSQL only; restarting loses no data (active WebSocket clients will reconnect).
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    <<: *always-restart
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-inference}:${POSTGRES_PASSWORD:-inference}@postgres:5432/${POSTGRES_DB:-inference}
+      INFERENCE_SERVICE_URL: http://inference:8001
+      METRICS_PORT: "8000"
+    networks:
+      - inference-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inference:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+    logging: *default-logging
+
+  # What it is:  React operator dashboard — static SPA served by nginx.
+  # What it does: Displays camera status, live detection feed (WebSocket), alert rules editor, and system health; proxies /api and /ws to the API service.
+  # Persistent state: EPHEMERAL — purely static build artifact; restarting is instant with no state to preserve.
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ""  # nginx proxies /api → api:8000
+    <<: *always-restart
+    networks:
+      - inference-net
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/ || exit 1"]
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    logging: *default-logging
+
+  # ── Observability ────────────────────────────────────────
+
+  # What it is:  Prometheus — time-series metrics database.
+  # What it does: Scrapes /metrics from inference, consumer, api, and RabbitMQ every 15 s; stores FPS, queue depth, latency histograms, and detection counters.
+  # Persistent state: DURABLE — 15 days of metrics survive restarts via the named volume `prometheus_data`; older data is auto-expired.
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    <<: *always-restart
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"          # allows POST /-/reload
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - inference-net
+    depends_on:
+      inference:
+        condition: service_healthy
+      consumer:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+    logging: *default-logging
+
+  # What it is:  Grafana — metrics visualisation and dashboard platform.
+  # What it does: Reads from Prometheus and renders the pre-provisioned "Real-Time Inference Platform" dashboard (FPS, queue depth, latency, detections by class).
+  # Persistent state: DURABLE — user-created dashboards and preferences persist in `grafana_data`; the provisioned dashboard is always re-applied from disk on startup.
+  grafana:
+    image: grafana/grafana:10.4.3
+    <<: *always-restart
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_PORT: "3001"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - inference-net
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-defaults
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/api/health || exit 1"]
+    ports:
+      - "${GRAFANA_PORT:-3001}:3001"
+    logging: *default-logging
+
+# ─────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────
+networks:
+  inference-net:
+    driver: bridge
+
+# ─────────────────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:

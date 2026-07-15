@@ -1,0 +1,166 @@
+{
+  "_comment": "RabbitMQ topology definitions — loaded at broker startup via load_definitions.",
+  "rabbitmq_version": "3.13",
+  "users": [
+    {
+      "name": "guest",
+      "password_hash": "CY9rzUYh03PK3k6DJie09g==",
+      "hashing_algorithm": "rabbit_password_hashing_md5",
+      "tags": ["administrator"],
+      "limits": {}
+    }
+  ],
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "permissions": [
+    {
+      "user": "guest",
+      "vhost": "/",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    }
+  ],
+  "exchanges": [
+    {
+      "_comment": "Main topic exchange — all detection events published here.",
+      "name": "detections",
+      "vhost": "/",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "_comment": "Dead-letter exchange for unroutable / rejected messages.",
+      "name": "detections.dlx",
+      "vhost": "/",
+      "type": "fanout",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "_comment": "Control plane exchange for sending reload/stop signals to the inference service.",
+      "name": "control",
+      "vhost": "/",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "queues": [
+    {
+      "_comment": "Consumer service queue: receives ALL camera detection events for persistence and alert evaluation.",
+      "name": "detections.consumer",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "detections.dlx",
+        "x-dead-letter-routing-key": "detections.consumer",
+        "x-message-ttl": 300000,
+        "x-max-length": 50000,
+        "x-overflow": "reject-publish-dlx",
+        "x-queue-type": "classic"
+      }
+    },
+    {
+      "_comment": "High-priority alert queue: receives only high-confidence detections for fast alerting.",
+      "name": "detections.alerts.high",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "detections.dlx",
+        "x-dead-letter-routing-key": "detections.alerts.high",
+        "x-message-ttl": 60000,
+        "x-max-length": 10000,
+        "x-overflow": "reject-publish-dlx",
+        "x-max-priority": 10,
+        "x-queue-type": "classic"
+      }
+    },
+    {
+      "_comment": "Dead-letter holding queue — inspect failed / TTL-expired messages.",
+      "name": "detections.dead-letter",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 86400000,
+        "x-max-length": 5000,
+        "x-overflow": "drop-head"
+      }
+    },
+    {
+      "_comment": "Inference service control queue — receives model-swap and camera reload commands.",
+      "name": "control.inference",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-message-ttl": 30000,
+        "x-max-length": 100
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "_comment": "Route all per-camera events to the consumer queue.",
+      "source": "detections",
+      "vhost": "/",
+      "destination": "detections.consumer",
+      "destination_type": "queue",
+      "routing_key": "camera.#",
+      "arguments": {}
+    },
+    {
+      "_comment": "Route high-priority alert events to the priority alert queue.",
+      "source": "detections",
+      "vhost": "/",
+      "destination": "detections.alerts.high",
+      "destination_type": "queue",
+      "routing_key": "alert.high",
+      "arguments": {}
+    },
+    {
+      "_comment": "DLX fanout routes all dead letters to the holding queue.",
+      "source": "detections.dlx",
+      "vhost": "/",
+      "destination": "detections.dead-letter",
+      "destination_type": "queue",
+      "routing_key": "#",
+      "arguments": {}
+    },
+    {
+      "_comment": "Route inference control commands by routing key 'inference'.",
+      "source": "control",
+      "vhost": "/",
+      "destination": "control.inference",
+      "destination_type": "queue",
+      "routing_key": "inference",
+      "arguments": {}
+    }
+  ],
+  "policies": [
+    {
+      "_comment": "Apply ha-mode none (single node) — add mirroring here when clustering.",
+      "vhost": "/",
+      "name": "detections-ha",
+      "pattern": "^detections",
+      "apply-to": "queues",
+      "definition": {
+        "ha-mode": "exactly",
+        "ha-params": 1,
+        "ha-sync-mode": "automatic"
+      },
+      "priority": 0
+    }
+  ]
+}

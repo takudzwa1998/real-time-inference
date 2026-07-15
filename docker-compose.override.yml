@@ -1,0 +1,41 @@
+# docker-compose.override.yml — DEV overrides
+#
+# Applied automatically when running `docker compose up`.
+# Exposes internal service ports to the host for direct access
+# (RabbitMQ management UI, PostgreSQL, Prometheus, individual APIs).
+# Do NOT commit secrets here; keep everything in .env.
+
+services:
+
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  rabbitmq:
+    ports:
+      - "${RABBITMQ_AMQP_PORT:-5672}:5672"
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672"  # Management UI: http://localhost:15672
+
+  inference:
+    ports:
+      - "${INFERENCE_PORT:-8001}:8001"
+    # Hot-reload source during development.
+    # weights/ bind-mount is already in docker-compose.yml and carries over here.
+    volumes:
+      - ./services/inference:/app:ro
+
+  consumer:
+    ports:
+      - "${CONSUMER_PORT:-8002}:8002"
+    volumes:
+      - ./services/consumer:/app:ro
+
+  api:
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./services/api:/app:ro
+
+  prometheus:
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
